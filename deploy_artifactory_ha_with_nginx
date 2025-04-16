@@ -1,0 +1,136 @@
+#!/bin/bash
+
+# ==============================
+# JFrog Artifactory HA + NGINX
+# ==============================
+
+set -e
+
+# ---- Configurable Variables ----
+ARTIFACTORY_VERSION="7.x.y"  # <-- replace with actual version
+DB_URL="jdbc:postgresql://<RDS-ENDPOINT>:5432/artifactory"
+DB_USER="artifactory"
+DB_PASS="StrongPassword"
+S3_BUCKET="my-artifactory-bucket"
+AWS_REGION="us-east-1"
+NODE_ID="$(hostname)"
+PRIMARY_NODE_IP="<PRIMARY_NODE_PRIVATE_IP>"
+HA_KEY_FILE="/opt/artifactory/var/etc/join.key"
+NGINX_RPM_URL="http://nginx.org/packages/rhel/7/x86_64/RPMS/nginx-1.24.0-1.el7.ngx.x86_64.rpm"  # Example
+ARTIFACTORY_ADMIN="admin"
+ARTIFACTORY_PASSWORD="password"  # Update securely
+
+# ---- 1. Update system & install dependencies ----
+echo "[1/8] Installing dependencies..."
+sudo yum update -y || sudo apt update -y
+sudo yum install -y wget curl unzip java-11-openjdk postgresql || sudo apt install -y wget curl unzip openjdk-11-jdk postgresql-client
+
+# ---- 2. Create Artifactory user & directories ----
+echo "[2/8] Creating Artifactory user and directories..."
+sudo useradd -m -d /opt/artifactory -s /bin/bash artifactory || true
+sudo mkdir -p /opt/artifactory
+sudo chown -R artifactory:artifactory /opt/artifactory
+
+# ---- 3. Download and install Artifactory ----
+echo "[3/8] Installing Artifactory..."
+sudo -u artifactory bash -c "
+cd /opt/artifactory
+wget https://releases.jfrog.io/artifactory/artifactory-pro/org/artifactory/pro/jfrog-artifactory-pro/${ARTIFACTORY_VERSION}/artifactory-pro-${ARTIFACTORY_VERSION}-linux.tar.gz -O artifactory.tar.gz
+tar -xvzf artifactory.tar.gz --strip-components=1
+rm -f artifactory.tar.gz
+"
+
+# ---- 4. Generate or retrieve HA key ----
+echo "[4/8] Handling HA Key..."
+if [[ "$(hostname -I | awk '{print $1}')" == "$PRIMARY_NODE_IP" ]]; then
+    HA_KEY=$(openssl rand -hex 32)
+    echo "$HA_KEY" | sudo tee "$HA_KEY_FILE"
+else
+    while [[ ! -f "$HA_KEY_FILE" ]]; do
+        scp artifactory@$PRIMARY_NODE_IP:$HA_KEY_FILE /tmp/join.key || true
+        if [[ -s /tmp/join.key ]]; then
+            sudo mv /tmp/join.key "$HA_KEY_FILE"
+            break
+        fi
+        echo "Waiting for HA_KEY..."
+        sleep 5
+    done
+    HA_KEY=$(cat "$HA_KEY_FILE")
+fi
+
+# ---- 5. Create system.yaml configuration ----
+echo "[5/8] Configuring system.yaml..."
+cat <<EOF | sudo tee /opt/artifactory/var/etc/system.yaml
+shared:
+  database:
+    type: postgresql
+    driver: org.postgresql.Driver
+    url: ${DB_URL}
+    username: ${DB_USER}
+    password: ${DB_PASS}
+  filestore:
+    type: s3
+    s3:
+      bucketName: ${S3_BUCKET}
+      region: ${AWS_REGION}
+node:
+  id: "${NODE_ID}"
+  haEnabled: true
+join:
+  key: "${HA_KEY}"
+EOF
+
+sudo chown -R artifactory:artifactory /opt/artifactory
+
+# ---- 6. Create systemd service for Artifactory ----
+echo "[6/8] Creating systemd service for Artifactory..."
+cat <<EOF | sudo tee /etc/systemd/system/artifactory.service
+[Unit]
+Description=Artifactory Service
+After=network.target
+
+[Service]
+User=artifactory
+WorkingDirectory=/opt/artifactory
+ExecStart=/opt/artifactory/app/bin/artifactoryctl start
+ExecStop=/opt/artifactory/app/bin/artifactoryctl stop
+Restart=always
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable artifactory
+sudo systemctl start artifactory
+
+# ---- 7. Install and configure Nginx from RPM ----
+echo "[7/8] Installing Nginx from RPM..."
+sudo yum install -y $NGINX_RPM_URL || {
+    echo "Nginx RPM install failed!"
+    exit 1
+}
+
+echo "Configuring Nginx as reverse proxy..."
+sudo tee /etc/nginx/conf.d/artifactory.conf > /dev/null <<EOF
+server {
+    listen 80;
+    server_name artifactory.local;
+
+    location / {
+        proxy_pass http://localhost:8082/;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+}
+EOF
+
+sudo systemctl enable nginx
+sudo systemctl restart nginx
+
+# ---- 8. Final status ----
+echo "[8/8] ✅ Deployment complete!"
+echo "Artifactory: http://<this-node-ip>/"
+echo "Login: ${ARTIFACTORY_ADMIN} / ${ARTIFACTORY_PASSWORD}"
